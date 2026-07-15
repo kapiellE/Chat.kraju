@@ -18,13 +18,24 @@
   #groupList { flex: 1; overflow-y: auto; margin-bottom: 10px; }
   .group-item { padding: 6px; background: #1e1e2f; margin: 4px 0; border-radius: 5px; cursor: pointer; }
   .group-item:hover { background: #3a3a55; }
+  .group-item.active { background: #4a4ae0; }
+  #chatHeader { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  #chatHeader h2 { flex: 1; font-size: 16px; }
+  #membersLine { font-size: 12px; color: #999; margin-bottom: 8px; }
   #chatMessages { flex: 1; overflow-y: auto; background: #1e1e2f; border-radius: 5px; padding: 10px; margin-bottom: 10px; }
-  .message { margin: 4px 0; }
+  .message { margin: 6px 0; }
   .message b { color: #8a8aff; }
+  .message .time { color: #777; font-size: 11px; margin-left: 6px; }
   #messageForm { display: flex; gap: 5px; }
   #messageInput { flex: 1; border: 2px solid #4a4ae0; }
   #messageForm button { width: auto; padding: 8px 16px; }
   h2 { margin-top: 0; text-align: center; }
+  #addMemberRow { display: flex; gap: 5px; margin-bottom: 8px; }
+  #addMemberRow input { margin: 0; }
+  #addMemberRow button { width: auto; padding: 8px 12px; margin: 0; }
+  #topBar { display: flex; justify-content: space-between; align-items: center; }
+  #topBar button { width: auto; padding: 6px 10px; margin: 0; background: #3a3a55; font-size: 12px; }
+  #logoutBtn:hover { background: #4a4a70; }
 
   /* Modal */
   .overlay { position: fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 10; }
@@ -55,13 +66,22 @@
 <!-- LOBBY -->
 <div id="lobby">
   <div class="panel" id="groupsPanel">
-    <h2>Groups</h2>
+    <div id="topBar">
+      <h2>Groups</h2>
+      <button type="button" id="logoutBtn">Log out</button>
+    </div>
     <div id="groupList"></div>
     <button type="button" id="createGroupBtn">Create Group</button>
-    <button type="button" id="joinGroupBtn">Join Group</button>
   </div>
   <div class="panel" id="chatPanel">
-    <h2 id="currentGroupTitle">No group selected</h2>
+    <div id="chatHeader">
+      <h2 id="currentGroupTitle">No group selected</h2>
+    </div>
+    <div id="membersLine"></div>
+    <div id="addMemberRow" class="hidden">
+      <input type="text" id="addMemberInput" placeholder="Add member by nickname" autocomplete="off">
+      <button type="button" id="addMemberBtn">Add</button>
+    </div>
     <div id="chatMessages"></div>
     <form id="messageForm">
       <input type="text" id="messageInput" placeholder="Type a message..." autocomplete="off">
@@ -85,11 +105,9 @@
 </div>
 
 <script>
-  // ---- In-memory data store (no server) ----
-  const users = {};      // { nickname: password }
-  const groups = {};     // { groupName: { members: [nick...], messages: [ {nick, text} ] } }
   let currentUser = null;
-  let currentGroup = null;
+  let currentGroup = null; // full group object from the server
+  let pollTimer = null;
 
   const authScreen = document.getElementById('authScreen');
   const lobby = document.getElementById('lobby');
@@ -98,11 +116,16 @@
   const nickInput = document.getElementById('nickInput');
   const passInput = document.getElementById('passInput');
   const registerBtn = document.getElementById('registerBtn');
+  const logoutBtn = document.getElementById('logoutBtn');
   const groupList = document.getElementById('groupList');
   const chatMessages = document.getElementById('chatMessages');
   const currentGroupTitle = document.getElementById('currentGroupTitle');
+  const membersLine = document.getElementById('membersLine');
   const messageForm = document.getElementById('messageForm');
   const messageInput = document.getElementById('messageInput');
+  const addMemberRow = document.getElementById('addMemberRow');
+  const addMemberInput = document.getElementById('addMemberInput');
+  const addMemberBtn = document.getElementById('addMemberBtn');
 
   const createGroupOverlay = document.getElementById('createGroupOverlay');
   const newGroupName = document.getElementById('newGroupName');
@@ -111,52 +134,145 @@
   const confirmCreateGroupBtn = document.getElementById('confirmCreateGroupBtn');
   const cancelCreateGroupBtn = document.getElementById('cancelCreateGroupBtn');
 
+  // ---- Small fetch helper ----
+  async function api(path, options = {}) {
+    const res = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      ...options,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* no body */ }
+    if (!res.ok) {
+      throw new Error(data.error || 'Something went wrong.');
+    }
+    return data;
+  }
+
   function showAuthMessage(text) {
     authMessage.textContent = text;
   }
 
   function getCredentials() {
     return {
-      nick: nickInput.value.trim(),
-      pass: passInput.value
+      username: nickInput.value.trim(),
+      password: passInput.value,
     };
   }
 
-  registerBtn.addEventListener('click', () => {
-    const { nick, pass } = getCredentials();
-    if (!nick || !pass) {
+  function formatTime(isoString) {
+    const d = new Date(isoString + 'Z');
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+
+  // ---- Auth ----
+  registerBtn.addEventListener('click', async () => {
+    const { username, password } = getCredentials();
+    if (!username || !password) {
       showAuthMessage('Enter a nickname and password.');
       return;
     }
-    if (users[nick]) {
-      showAuthMessage('That nickname is already taken.');
-      return;
+    try {
+      const data = await api('/api/register', {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      });
+      showAuthMessage(data.message || 'Registered successfully. You can log in now.');
+    } catch (err) {
+      showAuthMessage(err.message);
     }
-    users[nick] = pass;
-    showAuthMessage('Registered successfully. You can log in now.');
   });
 
-  authForm.addEventListener('submit', (e) => {
+  authForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const { nick, pass } = getCredentials();
-    if (!nick || !pass) {
+    const { username, password } = getCredentials();
+    if (!username || !password) {
       showAuthMessage('Enter a nickname and password.');
       return;
     }
-    if (!users[nick] || users[nick] !== pass) {
-      showAuthMessage('Invalid nickname or password.');
-      return;
+    try {
+      const data = await api('/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      });
+      currentUser = data.username;
+      enterLobby();
+    } catch (err) {
+      showAuthMessage(err.message);
     }
-    currentUser = nick;
+  });
+
+  logoutBtn.addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
+    stopPolling();
+    currentUser = null;
+    currentGroup = null;
+    lobby.classList.remove('active');
+    authScreen.classList.remove('hidden');
+    nickInput.value = '';
+    passInput.value = '';
+    showAuthMessage('');
+  });
+
+  async function enterLobby() {
     authScreen.classList.add('hidden');
     lobby.classList.add('active');
-  });
+    await refreshGroupList();
+  }
+
+  // Restore session on page load/refresh instead of forcing a fresh login.
+  async function checkExistingSession() {
+    try {
+      const data = await api('/api/me');
+      if (data.logged_in) {
+        currentUser = data.username;
+        await enterLobby();
+      }
+    } catch (err) { /* not logged in, stay on auth screen */ }
+  }
+
+  // ---- Groups ----
+  async function refreshGroupList() {
+    const data = await api('/api/groups');
+    renderGroupList(data.groups);
+    // Keep the open group's info (like member list) fresh too.
+    if (currentGroup) {
+      const updated = data.groups.find(g => g.id === currentGroup.id);
+      if (updated) selectGroup(updated, false);
+    }
+  }
+
+  function renderGroupList(groups) {
+    groupList.innerHTML = '';
+    groups.forEach(group => {
+      const div = document.createElement('div');
+      div.className = 'group-item' + (currentGroup && currentGroup.id === group.id ? ' active' : '');
+      div.textContent = group.name;
+      div.addEventListener('click', () => selectGroup(group));
+      groupList.appendChild(div);
+    });
+  }
+
+  function selectGroup(group, doFetchMessages = true) {
+    currentGroup = group;
+    currentGroupTitle.textContent = group.name;
+    membersLine.textContent = 'Owner: ' + group.owner + ' · Members: ' + group.members.join(', ');
+    addMemberRow.classList.toggle('hidden', group.owner !== currentUser);
+    Array.from(groupList.children).forEach((el, i) => {
+      el.classList.toggle('active', el.textContent === group.name);
+    });
+    if (doFetchMessages) {
+      loadMessages();
+      startPolling();
+    }
+  }
 
   // ---- Create Group Modal ----
-  document.getElementById('createGroupBtn').addEventListener('click', () => {
+  document.getElementById('createGroupBtn').addEventListener('click', async () => {
     newGroupName.value = '';
     modalError.textContent = '';
-    renderUserCheckList();
+    await renderUserCheckList();
     createGroupOverlay.classList.add('active');
   });
 
@@ -164,94 +280,130 @@
     createGroupOverlay.classList.remove('active');
   });
 
-  function renderUserCheckList() {
-    userCheckList.innerHTML = '';
-    const otherUsers = Object.keys(users).filter(u => u !== currentUser);
-    if (otherUsers.length === 0) {
-      userCheckList.innerHTML = '<p style="text-align:center; color:#888;">No other registered users yet.</p>';
-      return;
+  async function renderUserCheckList() {
+    userCheckList.innerHTML = 'Loading…';
+    try {
+      const data = await api('/api/users');
+      userCheckList.innerHTML = '';
+      if (!data.users.length) {
+        userCheckList.innerHTML = '<p style="text-align:center; color:#888;">No other registered users yet.</p>';
+        return;
+      }
+      data.users.forEach(u => {
+        const div = document.createElement('div');
+        div.className = 'user-check-item';
+        const checkboxId = 'chk-' + u;
+        div.innerHTML = `<input type="checkbox" id="${checkboxId}" value="${u}"><label for="${checkboxId}">${u}</label>`;
+        userCheckList.appendChild(div);
+      });
+    } catch (err) {
+      userCheckList.innerHTML = '';
+      modalError.textContent = err.message;
     }
-    otherUsers.forEach(u => {
-      const div = document.createElement('div');
-      div.className = 'user-check-item';
-      const checkboxId = 'chk-' + u;
-      div.innerHTML = `<input type="checkbox" id="${checkboxId}" value="${u}"><label for="${checkboxId}">${u}</label>`;
-      userCheckList.appendChild(div);
-    });
   }
 
-  confirmCreateGroupBtn.addEventListener('click', () => {
+  confirmCreateGroupBtn.addEventListener('click', async () => {
     const name = newGroupName.value.trim();
     if (!name) {
       modalError.textContent = 'Enter a group name.';
       return;
     }
-    if (groups[name]) {
-      modalError.textContent = 'That group already exists.';
-      return;
-    }
     const checked = Array.from(userCheckList.querySelectorAll('input[type="checkbox"]:checked'))
       .map(cb => cb.value);
-    const members = Array.from(new Set([currentUser, ...checked]));
-
-    groups[name] = { members: members, messages: [] };
-    createGroupOverlay.classList.remove('active');
-    renderGroupList();
-    selectGroup(name);
+    try {
+      const data = await api('/api/groups', {
+        method: 'POST',
+        body: JSON.stringify({ name, members: checked }),
+      });
+      createGroupOverlay.classList.remove('active');
+      await refreshGroupList();
+      selectGroup(data.group);
+    } catch (err) {
+      modalError.textContent = err.message;
+    }
   });
 
-  document.getElementById('joinGroupBtn').addEventListener('click', () => {
-    const name = prompt('Enter the name of the group to join:');
-    if (!name) return;
-    if (!groups[name]) {
-      alert('That group does not exist.');
-      return;
+  // ---- Add member (owner only) ----
+  addMemberBtn.addEventListener('click', async () => {
+    const username = addMemberInput.value.trim();
+    if (!username || !currentGroup) return;
+    try {
+      const data = await api(`/api/groups/${currentGroup.id}/members`, {
+        method: 'POST',
+        body: JSON.stringify({ username }),
+      });
+      addMemberInput.value = '';
+      await refreshGroupList();
+      selectGroup(data.group, false);
+    } catch (err) {
+      alert(err.message);
     }
-    if (!groups[name].members.includes(currentUser)) {
-      groups[name].members.push(currentUser);
-    }
-    renderGroupList();
-    selectGroup(name);
   });
 
-  function renderGroupList() {
-    groupList.innerHTML = '';
-    Object.keys(groups).forEach(name => {
-      const div = document.createElement('div');
-      div.className = 'group-item';
-      div.textContent = name;
-      div.addEventListener('click', () => selectGroup(name));
-      groupList.appendChild(div);
-    });
-  }
-
-  function selectGroup(name) {
-    currentGroup = name;
-    const members = groups[name].members.join(', ');
-    currentGroupTitle.textContent = name + ' (' + members + ')';
-    renderMessages();
-  }
-
-  function renderMessages() {
-    chatMessages.innerHTML = '';
+  // ---- Chat ----
+  async function loadMessages() {
     if (!currentGroup) return;
-    groups[currentGroup].messages.forEach(msg => {
+    try {
+      const data = await api(`/api/groups/${currentGroup.id}/messages`);
+      renderMessages(data.messages);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  function renderMessages(messages) {
+    chatMessages.innerHTML = '';
+    messages.forEach(msg => {
       const div = document.createElement('div');
       div.className = 'message';
-      div.innerHTML = '<b>' + msg.nick + '</b> : ' + msg.text;
+      const b = document.createElement('b');
+      b.textContent = msg.username;
+      const span = document.createElement('span');
+      span.textContent = ' : ' + msg.text;
+      const time = document.createElement('span');
+      time.className = 'time';
+      time.textContent = formatTime(msg.time);
+      div.appendChild(b);
+      div.appendChild(span);
+      div.appendChild(time);
       chatMessages.appendChild(div);
     });
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 
-  messageForm.addEventListener('submit', (e) => {
+  messageForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = messageInput.value.trim();
     if (!text || !currentGroup || !currentUser) return;
-    groups[currentGroup].messages.push({ nick: currentUser, text: text });
     messageInput.value = '';
-    renderMessages();
+    try {
+      await api(`/api/groups/${currentGroup.id}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+      });
+      await loadMessages();
+    } catch (err) {
+      alert(err.message);
+    }
   });
+
+  // Poll for new messages/members every few seconds so a group chat updates
+  // without requiring a manual refresh.
+  function startPolling() {
+    stopPolling();
+    pollTimer = setInterval(() => {
+      loadMessages();
+    }, 3000);
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  checkExistingSession();
 </script>
 
 </body>
