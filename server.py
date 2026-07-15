@@ -1,71 +1,149 @@
-from flask import Flask, request, jsonify, session, render_template
-from werkzeug.security import generate_password_hash, check_password_hash
-import json
 import os
-import time
-import uuid
+import sqlite3
+from datetime import datetime
 
-app = Flask(__name__)
-app.secret_key = "patchone-dev-secret-key-change-me"
+from flask import Flask, g, jsonify, render_template, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
-MESSAGES_FILE = os.path.join(DATA_DIR, "messages.json")
+DB_PATH = os.path.join(BASE_DIR, "patchone.db")
+SECRET_KEY_PATH = os.path.join(BASE_DIR, "secret.key")
 
-MAX_GROUP_SIZE = 10
+app = Flask(__name__)
+
+
+def get_secret_key():
+    # Keep the session secret stable across restarts so logged-in users
+    # aren't kicked out every time the server restarts.
+    if os.path.exists(SECRET_KEY_PATH):
+        with open(SECRET_KEY_PATH, "r") as f:
+            return f.read().strip()
+    key = os.urandom(32).hex()
+    with open(SECRET_KEY_PATH, "w") as f:
+        f.write(key)
+    return key
+
+
+app.secret_key = get_secret_key()
 
 
 # ---------------------------------------------------------------------------
-# Storage helpers
+# Database helpers
 # ---------------------------------------------------------------------------
 
-def ensure_data_files():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "w") as f:
-            json.dump({}, f)
-    if not os.path.exists(GROUPS_FILE):
-        with open(GROUPS_FILE, "w") as f:
-            json.dump({}, f)
-    if not os.path.exists(MESSAGES_FILE):
-        with open(MESSAGES_FILE, "w") as f:
-            json.dump([], f)
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+    return g.db
 
 
-def load_json(path):
-    with open(path, "r") as f:
-        return json.load(f)
+@app.teardown_appcontext
+def close_db(exception=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
 
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+def init_db():
+    db = sqlite3.connect(DB_PATH)
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            owner_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES users (id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS group_members (
+            group_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY (group_id, user_id),
+            FOREIGN KEY (group_id) REFERENCES groups (id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (group_id) REFERENCES groups (id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+        """
+    )
+    db.commit()
+    db.close()
 
 
-def load_users():
-    return load_json(USERS_FILE)
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def current_user_row():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    db = get_db()
+    return db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
-def save_users(users):
-    save_json(USERS_FILE, users)
+def require_login():
+    user = current_user_row()
+    if not user:
+        return None, (jsonify(error="Not logged in."), 401)
+    return user, None
 
 
-def load_groups():
-    return load_json(GROUPS_FILE)
+def is_member(db, group_id, user_id):
+    row = db.execute(
+        "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
+        (group_id, user_id),
+    ).fetchone()
+    return row is not None
 
 
-def save_groups(groups):
-    save_json(GROUPS_FILE, groups)
-
-
-def load_messages():
-    return load_json(MESSAGES_FILE)
-
-
-def save_messages(messages):
-    save_json(MESSAGES_FILE, messages)
+def group_to_dict(db, group_row):
+    members = db.execute(
+        """
+        SELECT users.username FROM group_members
+        JOIN users ON users.id = group_members.user_id
+        WHERE group_members.group_id = ?
+        ORDER BY users.username COLLATE NOCASE
+        """,
+        (group_row["id"],),
+    ).fetchall()
+    owner = db.execute(
+        "SELECT username FROM users WHERE id = ?", (group_row["owner_id"],)
+    ).fetchone()
+    return {
+        "id": group_row["id"],
+        "name": group_row["name"],
+        "owner": owner["username"] if owner else None,
+        "owner_id": group_row["owner_id"],
+        "members": [m["username"] for m in members],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -82,230 +160,250 @@ def index():
 # ---------------------------------------------------------------------------
 
 @app.route("/api/register", methods=["POST"])
-def api_register():
+def register():
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
 
     if not username or not password:
-        return jsonify({"ok": False, "error": "Username and password are required."}), 400
+        return jsonify(error="Enter a nickname and password."), 400
+    if len(username) > 32:
+        return jsonify(error="Nickname is too long."), 400
 
-    if len(username) < 3:
-        return jsonify({"ok": False, "error": "Username must be at least 3 characters."}), 400
+    db = get_db()
+    existing = db.execute(
+        "SELECT id FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    if existing:
+        return jsonify(error="That nickname is already taken."), 409
 
-    if len(password) < 4:
-        return jsonify({"ok": False, "error": "Password must be at least 4 characters."}), 400
-
-    users = load_users()
-
-    for existing in users.keys():
-        if existing.lower() == username.lower():
-            return jsonify({"ok": False, "error": "That username is already taken."}), 409
-
-    users[username] = {
-        "password_hash": generate_password_hash(password),
-        "created_at": time.time(),
-    }
-    save_users(users)
-
-    return jsonify({"ok": True, "message": "Account created. You can now log in."})
+    password_hash = generate_password_hash(password)
+    db.execute(
+        "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+        (username, password_hash, datetime.utcnow().isoformat()),
+    )
+    db.commit()
+    return jsonify(message="Registered successfully. You can log in now.")
 
 
 @app.route("/api/login", methods=["POST"])
-def api_login():
+def login():
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
 
-    users = load_users()
+    db = get_db()
+    user = db.execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    if not user or not check_password_hash(user["password_hash"], password):
+        return jsonify(error="Invalid nickname or password."), 401
 
-    matched_username = None
-    for existing in users.keys():
-        if existing.lower() == username.lower():
-            matched_username = existing
-            break
-
-    if not matched_username or not check_password_hash(users[matched_username]["password_hash"], password):
-        return jsonify({"ok": False, "error": "Invalid username or password."}), 401
-
-    session["username"] = matched_username
-    return jsonify({"ok": True, "username": matched_username})
+    session["user_id"] = user["id"]
+    return jsonify(username=user["username"])
 
 
 @app.route("/api/logout", methods=["POST"])
-def api_logout():
-    session.pop("username", None)
-    return jsonify({"ok": True})
+def logout():
+    session.clear()
+    return jsonify(message="Logged out.")
 
 
-@app.route("/api/me", methods=["GET"])
-def api_me():
-    username = session.get("username")
-    if not username:
-        return jsonify({"ok": False, "logged_in": False})
-    return jsonify({"ok": True, "logged_in": True, "username": username})
+@app.route("/api/me")
+def me():
+    user = current_user_row()
+    if not user:
+        return jsonify(logged_in=False)
+    return jsonify(logged_in=True, username=user["username"])
 
 
-def require_login():
-    return session.get("username")
-
-
-# ---------------------------------------------------------------------------
-# Global chat API
-# ---------------------------------------------------------------------------
-
-@app.route("/api/messages", methods=["GET"])
-def api_get_messages():
-    username = require_login()
-    if not username:
-        return jsonify({"ok": False, "error": "Not logged in."}), 401
-
-    messages = load_messages()
-    return jsonify({"ok": True, "messages": messages[-200:]})
-
-
-@app.route("/api/messages", methods=["POST"])
-def api_post_message():
-    username = require_login()
-    if not username:
-        return jsonify({"ok": False, "error": "Not logged in."}), 401
-
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
-
-    if not text:
-        return jsonify({"ok": False, "error": "Message cannot be empty."}), 400
-
-    if len(text) > 500:
-        text = text[:500]
-
-    messages = load_messages()
-    messages.append({
-        "username": username,
-        "text": text,
-        "timestamp": time.time(),
-    })
-    save_messages(messages)
-
-    return jsonify({"ok": True})
+@app.route("/api/users")
+def list_users():
+    user, err = require_login()
+    if err:
+        return err
+    db = get_db()
+    rows = db.execute(
+        "SELECT username FROM users WHERE id != ? ORDER BY username COLLATE NOCASE",
+        (user["id"],),
+    ).fetchall()
+    return jsonify(users=[r["username"] for r in rows])
 
 
 # ---------------------------------------------------------------------------
-# Groups API
+# Group API
 # ---------------------------------------------------------------------------
 
 @app.route("/api/groups", methods=["GET"])
-def api_get_groups():
-    username = require_login()
-    if not username:
-        return jsonify({"ok": False, "error": "Not logged in."}), 401
-
-    groups = load_groups()
-    group_list = []
-    for group_id, group in groups.items():
-        group_list.append({
-            "id": group_id,
-            "name": group["name"],
-            "owner": group["owner"],
-            "members": group["members"],
-            "member_count": len(group["members"]),
-            "max_members": MAX_GROUP_SIZE,
-        })
-
-    group_list.sort(key=lambda g: g.get("member_count", 0), reverse=True)
-
-    return jsonify({"ok": True, "groups": group_list})
+def list_groups():
+    user, err = require_login()
+    if err:
+        return err
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT groups.* FROM groups
+        JOIN group_members ON group_members.group_id = groups.id
+        WHERE group_members.user_id = ?
+        ORDER BY groups.created_at
+        """,
+        (user["id"],),
+    ).fetchall()
+    return jsonify(groups=[group_to_dict(db, r) for r in rows])
 
 
-@app.route("/api/groups/create", methods=["POST"])
-def api_create_group():
-    username = require_login()
-    if not username:
-        return jsonify({"ok": False, "error": "Not logged in."}), 401
-
+@app.route("/api/groups", methods=["POST"])
+def create_group():
+    user, err = require_login()
+    if err:
+        return err
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
+    member_usernames = data.get("members") or []
 
     if not name:
-        return jsonify({"ok": False, "error": "Group name is required."}), 400
+        return jsonify(error="Enter a group name."), 400
 
-    if len(name) > 50:
-        name = name[:50]
+    db = get_db()
+    existing = db.execute("SELECT id FROM groups WHERE name = ?", (name,)).fetchone()
+    if existing:
+        return jsonify(error="That group already exists."), 409
 
-    groups = load_groups()
+    cur = db.execute(
+        "INSERT INTO groups (name, owner_id, created_at) VALUES (?, ?, ?)",
+        (name, user["id"], datetime.utcnow().isoformat()),
+    )
+    group_id = cur.lastrowid
 
-    group_id = uuid.uuid4().hex[:8]
-    groups[group_id] = {
-        "name": name,
-        "owner": username,
-        "members": [username],
-        "created_at": time.time(),
-    }
-    save_groups(groups)
+    # Owner is always a member.
+    db.execute(
+        "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)",
+        (group_id, user["id"]),
+    )
 
-    return jsonify({"ok": True, "group_id": group_id})
+    if member_usernames:
+        placeholders = ",".join("?" for _ in member_usernames)
+        rows = db.execute(
+            f"SELECT id FROM users WHERE username IN ({placeholders})",
+            member_usernames,
+        ).fetchall()
+        for r in rows:
+            db.execute(
+                "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)",
+                (group_id, r["id"]),
+            )
+
+    db.commit()
+    group_row = db.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+    return jsonify(group=group_to_dict(db, group_row))
 
 
-@app.route("/api/groups/join", methods=["POST"])
-def api_join_group():
-    username = require_login()
-    if not username:
-        return jsonify({"ok": False, "error": "Not logged in."}), 401
+@app.route("/api/groups/<int:group_id>/join", methods=["POST"])
+def join_group(group_id):
+    user, err = require_login()
+    if err:
+        return err
+    db = get_db()
+    group_row = db.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+    if not group_row:
+        return jsonify(error="That group does not exist."), 404
+    db.execute(
+        "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)",
+        (group_id, user["id"]),
+    )
+    db.commit()
+    return jsonify(group=group_to_dict(db, group_row))
+
+
+@app.route("/api/groups/<int:group_id>/members", methods=["POST"])
+def add_member(group_id):
+    user, err = require_login()
+    if err:
+        return err
+    db = get_db()
+    group_row = db.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+    if not group_row:
+        return jsonify(error="That group does not exist."), 404
+    if group_row["owner_id"] != user["id"]:
+        return jsonify(error="Only the group owner can add members."), 403
 
     data = request.get_json(silent=True) or {}
-    group_id = (data.get("group_id") or "").strip()
-
-    groups = load_groups()
-
-    if group_id not in groups:
-        return jsonify({"ok": False, "error": "Group not found."}), 404
-
-    group = groups[group_id]
-
-    if username in group["members"]:
-        return jsonify({"ok": False, "error": "You are already in this group."}), 400
-
-    if len(group["members"]) >= MAX_GROUP_SIZE:
-        return jsonify({"ok": False, "error": "This group is full (max 10 players)."}), 400
-
-    group["members"].append(username)
-    save_groups(groups)
-
-    return jsonify({"ok": True, "message": "Joined group '{}'.".format(group["name"])})
-
-
-@app.route("/api/groups/leave", methods=["POST"])
-def api_leave_group():
-    username = require_login()
+    username = (data.get("username") or "").strip()
     if not username:
-        return jsonify({"ok": False, "error": "Not logged in."}), 401
+        return jsonify(error="Enter a nickname to add."), 400
+
+    target = db.execute(
+        "SELECT id FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    if not target:
+        return jsonify(error="No user with that nickname."), 404
+
+    db.execute(
+        "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)",
+        (group_id, target["id"]),
+    )
+    db.commit()
+    return jsonify(group=group_to_dict(db, group_row))
+
+
+# ---------------------------------------------------------------------------
+# Chat API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/groups/<int:group_id>/messages", methods=["GET"])
+def get_messages(group_id):
+    user, err = require_login()
+    if err:
+        return err
+    db = get_db()
+    if not is_member(db, group_id, user["id"]):
+        return jsonify(error="You are not a member of this group."), 403
+
+    rows = db.execute(
+        """
+        SELECT messages.text, messages.created_at, users.username
+        FROM messages
+        JOIN users ON users.id = messages.user_id
+        WHERE messages.group_id = ?
+        ORDER BY messages.id ASC
+        """,
+        (group_id,),
+    ).fetchall()
+    messages = [
+        {
+            "username": r["username"],
+            "text": r["text"],
+            "time": r["created_at"],
+        }
+        for r in rows
+    ]
+    return jsonify(messages=messages)
+
+
+@app.route("/api/groups/<int:group_id>/messages", methods=["POST"])
+def post_message(group_id):
+    user, err = require_login()
+    if err:
+        return err
+    db = get_db()
+    if not is_member(db, group_id, user["id"]):
+        return jsonify(error="You are not a member of this group."), 403
 
     data = request.get_json(silent=True) or {}
-    group_id = (data.get("group_id") or "").strip()
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify(error="Message is empty."), 400
 
-    groups = load_groups()
+    created_at = datetime.utcnow().isoformat()
+    db.execute(
+        "INSERT INTO messages (group_id, user_id, text, created_at) VALUES (?, ?, ?, ?)",
+        (group_id, user["id"], text, created_at),
+    )
+    db.commit()
+    return jsonify(username=user["username"], text=text, time=created_at)
 
-    if group_id not in groups:
-        return jsonify({"ok": False, "error": "Group not found."}), 404
 
-    group = groups[group_id]
-
-    if username not in group["members"]:
-        return jsonify({"ok": False, "error": "You are not in this group."}), 400
-
-    group["members"].remove(username)
-
-    if len(group["members"]) == 0:
-        del groups[group_id]
-    else:
-        if group["owner"] == username:
-            group["owner"] = group["members"][0]
-
-    save_groups(groups)
-
-    return jsonify({"ok": True})
-
+init_db()
 
 if __name__ == "__main__":
-    ensure_data_files()
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True)
